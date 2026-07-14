@@ -6275,6 +6275,7 @@ enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
     GATING_FUNC_SOFTMAX_WEIGHT,
+    GATING_FUNC_SQRT_SOFTPLUS,
 };
 
 struct test_topk_moe : public test_case {
@@ -6319,6 +6320,9 @@ struct test_topk_moe : public test_case {
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) : logits;
+        if (gating_func == GATING_FUNC_SQRT_SOFTPLUS) {
+            probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        }
         ggml_set_name(probs, "probs");
 
         ggml_tensor * selection_probs = probs;
@@ -9904,12 +9908,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({144, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                 }
             }
         }
     }
+    test_cases.emplace_back(new test_topk_moe({144, 22, 1, 1}, 6, true, true, GATING_FUNC_SQRT_SOFTPLUS, 1.5f));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

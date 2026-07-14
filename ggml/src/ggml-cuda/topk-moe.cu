@@ -8,6 +8,7 @@
 // Kernel config struct - passed by value to CUDA kernel
 struct topk_moe_config {
     bool use_sigmoid;
+    bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
 };
@@ -69,7 +70,7 @@ __device__ void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const in
 
 /*
     This kernel does the following:
-    1. optionally softmax over the logits per token [n_experts, n_tokens]
+    1. apply the gating function to logits per token [n_experts, n_tokens]
     2. argmax reduce over the top-k (n_experts_used) logits
     3. write weights + ids to global memory
     4. optionally normalize the weights or apply softmax over the selected logits
@@ -95,7 +96,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     weights += n_expert_used * row;
     ids += n_experts * row;
 
-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? (n_experts + WARP_SIZE - 1) / WARP_SIZE : 1;
 
     float wt[experts_per_thread];
 
@@ -112,11 +113,20 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
     }
 
-    if (!config.delayed_softmax) {
+    if (config.use_sqrt_softplus) {
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const int expert = threadIdx.x + i * WARP_SIZE;
+            if (expert < n_experts) {
+                const float value = wt[i];
+                wt[i] = sqrtf(value > 20.0f ? value : logf(1.0f + expf(value)));
+            }
+        }
+    } else if (!config.delayed_softmax) {
         if (config.use_sigmoid) {
-           sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
+           sigmoid_warp_inplace<experts_per_thread, n_experts % WARP_SIZE != 0>(wt, n_experts, threadIdx.x);
         } else {
-           softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
+           softmax_warp_inplace<experts_per_thread, n_experts % WARP_SIZE != 0>(wt, n_experts, threadIdx.x);
         }
     }
 
@@ -308,6 +318,10 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
+        case 144: // DeepSeek V4 Flash
+            ggml_cuda_kernel_launch(topk_moe_cuda<144, has_bias>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            break;
         case 256:
             ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
@@ -364,9 +378,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     }
 
     topk_moe_config config;
-    config.use_sigmoid     = args.sigmoid;
-    config.with_norm       = with_norm;
-    config.delayed_softmax = args.delayed_softmax;
+    config.use_sigmoid       = args.sigmoid;
+    config.use_sqrt_softplus = args.sqrt_softplus;
+    config.with_norm         = with_norm;
+    config.delayed_softmax   = args.delayed_softmax;
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
@@ -384,7 +399,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
     // or one of the non-power-of-2 expert counts of supported models
     const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
+    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 144 && n_expert != 288 && n_expert != 576) {
         return false;
     }
 
@@ -415,7 +430,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     } else if (gating_op->op == GGML_OP_UNARY) {
         ggml_unary_op op = ggml_get_unary_op(gating_op);
 
-        if (op != GGML_UNARY_OP_SIGMOID) {
+        if (op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SOFTPLUS) {
             return false;
         }
     }
